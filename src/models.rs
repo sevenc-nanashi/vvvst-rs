@@ -33,8 +33,13 @@ pub enum RequestInner {
     SetProject(String),
     SetPhrases(Vec<Phrase>),
     SetSamples(BTreeMap<AudioHash, Vec<f32>>),
+
+    ShowMessageDialog(ShowMessageDialog),
     ShowImportFileDialog(ShowImportFileDialog),
+    ShowQuestionDialog(ShowQuestionDialog),
+
     ReadFile(String),
+
     ExportProject,
 }
 
@@ -42,7 +47,10 @@ pub enum RequestInner {
 #[serde(rename_all = "camelCase")]
 pub struct ShowImportFileDialog {
     pub title: String,
-    pub filters: Vec<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub filters: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,4 +59,41 @@ pub struct Phrase {
     pub start_at: f32,
     pub duration: f32,
     pub audio_hash: AudioHash,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPhraseResult {
+    pub missing_audio_hashes: Vec<AudioHash>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShowMessageDialog {
+    pub r#type: DialogType,
+    pub title: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DialogType {
+    None,
+    Info,
+    Warning,
+    Error,
+    Question,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShowQuestionDialog {
+    pub r#type: DialogType,
+    pub title: String,
+    pub message: String,
+    pub buttons: Vec<String>,
+    #[serde(default)]
+    pub cancel_id: Option<usize>,
+    #[serde(default)]
+    pub default_id: Option<usize>,
 }

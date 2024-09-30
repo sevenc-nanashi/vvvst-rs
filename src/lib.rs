@@ -1,11 +1,12 @@
 mod models;
 mod utils;
+use base64::{engine::general_purpose::STANDARD as base64, Engine as _};
 use include_dir::{include_dir, Dir};
 use nih_plug::prelude::*;
 use nih_plug_webview::*;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use tokio::runtime::Runtime;
 use utils::TokioMutexParam;
@@ -40,7 +41,7 @@ impl Default for Vvvst {
 #[derive(Params, Default)]
 struct VvvstParams {
     #[persist = "samples"]
-    samples: TokioMutexParam<BTreeMap<AudioHash, f32>>,
+    samples: TokioMutexParam<BTreeMap<AudioHash, Vec<f32>>>,
     #[persist = "phrases"]
     phrases: TokioMutexParam<Vec<Phrase>>,
     #[persist = "project"]
@@ -87,8 +88,128 @@ impl Vvvst {
                 *project_ref = project;
                 Ok(serde_json::Value::Null)
             }
-            _ => {
-                anyhow::bail!("not implemented");
+            RequestInner::SetPhrases(phrases) => {
+                let mut phrases_ref = params.phrases.lock().await;
+                *phrases_ref = phrases;
+
+                let mut samples = params.samples.lock().await.clone();
+                let missing_audio_hashes = phrases_ref
+                    .iter()
+                    .filter_map(|phrase| {
+                        if samples.get(&phrase.audio_hash).is_some() {
+                            None
+                        } else {
+                            Some(phrase.audio_hash)
+                        }
+                    })
+                    .collect::<BTreeSet<_>>();
+                let unused_audio_hashes = samples
+                    .keys()
+                    .filter(|audio_hash| {
+                        !phrases_ref
+                            .iter()
+                            .any(|phrase| phrase.audio_hash == **audio_hash)
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                for audio_hash in unused_audio_hashes {
+                    samples.remove(&audio_hash);
+                }
+                Ok(serde_json::to_value(SetPhraseResult {
+                    missing_audio_hashes: missing_audio_hashes.into_iter().collect(),
+                })?)
+            }
+            RequestInner::SetSamples(samples) => {
+                let mut samples_ref = params.samples.lock().await;
+                for (audio_hash, sample) in samples {
+                    samples_ref.insert(audio_hash, sample);
+                }
+                Ok(serde_json::Value::Null)
+            }
+            RequestInner::ShowImportFileDialog(params) => {
+                let dialog = rfd::AsyncFileDialog::new().set_title(&params.title);
+                let dialog = if params.name.is_some() && params.filters.is_some() {
+                    dialog.add_filter(&params.name.unwrap(), &params.filters.unwrap())
+                } else {
+                    dialog
+                };
+
+                let result = dialog.pick_file().await;
+                return Ok(serde_json::to_value(
+                    result.map(|path| path.path().to_string_lossy().to_string()),
+                )?);
+            }
+            RequestInner::ReadFile(path) => {
+                let content = tokio::fs::read(path).await?;
+                let encoded = base64.encode(&content);
+                Ok(serde_json::to_value(encoded)?)
+            }
+            RequestInner::ExportProject => {
+                let destination = rfd::AsyncFileDialog::new()
+                    .set_title("プロジェクトファイルの書き出し")
+                    .add_filter("VOICEVOX Project File", &["vvproj"])
+                    .save_file()
+                    .await;
+                if let Some(destination) = destination {
+                    let project = params.project.lock().await.clone();
+                    tokio::fs::write(destination.path(), project).await?;
+                    return Ok(serde_json::Value::Bool(true));
+                } else {
+                    return Ok(serde_json::Value::Bool(false));
+                }
+            }
+            RequestInner::ShowMessageDialog(params) => {
+                let dialog = rfd::AsyncMessageDialog::new()
+                    .set_title(&params.title)
+                    .set_description(&params.message)
+                    .set_buttons(rfd::MessageButtons::Ok);
+                let dialog = match params.r#type {
+                    DialogType::Info => dialog.set_level(rfd::MessageLevel::Info),
+                    DialogType::Warning => dialog.set_level(rfd::MessageLevel::Warning),
+                    DialogType::Error => dialog.set_level(rfd::MessageLevel::Error),
+                    _ => dialog,
+                };
+                dialog.show().await;
+
+                return Ok(serde_json::Value::Null);
+            }
+            RequestInner::ShowQuestionDialog(params) => {
+                anyhow::ensure!(
+                    (1..=3).contains(&params.buttons.len()),
+                    "The number of buttons must be 1 to 3"
+                );
+                let dialog = rfd::AsyncMessageDialog::new()
+                    .set_title(&params.title)
+                    .set_description(&params.message);
+                let dialog = match params.r#type {
+                    DialogType::Info => dialog.set_level(rfd::MessageLevel::Info),
+                    DialogType::Warning => dialog.set_level(rfd::MessageLevel::Warning),
+                    DialogType::Error => dialog.set_level(rfd::MessageLevel::Error),
+                    _ => dialog,
+                };
+                let dialog = dialog.set_buttons(match params.buttons.len() {
+                    1 => rfd::MessageButtons::OkCustom(params.buttons[0].clone()),
+                    2 => rfd::MessageButtons::OkCancelCustom(
+                        params.buttons[0].clone(),
+                        params.buttons[1].clone(),
+                    ),
+                    3 => rfd::MessageButtons::YesNoCancelCustom(
+                        params.buttons[0].clone(),
+                        params.buttons[1].clone(),
+                        params.buttons[2].clone(),
+                    ),
+                    _ => unreachable!(),
+                });
+                let result = dialog.show().await;
+                let rfd::MessageDialogResult::Custom(custom_text) = result else {
+                    anyhow::bail!("Unexpected dialog result: {:?}", result);
+                };
+                return Ok(serde_json::to_value(
+                    params
+                        .buttons
+                        .iter()
+                        .position(|button| button == &custom_text),
+                )?);
             }
         }
     }
@@ -241,7 +362,7 @@ impl Plugin for Vvvst {
 }
 
 impl Vst3Plugin for Vvvst {
-    const VST3_CLASS_ID: [u8; 16] = *b"VoicevoxForVst3\0";
+    const VST3_CLASS_ID: [u8; 16] = *b"VVVST___________";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
         &[Vst3SubCategory::Synth, Vst3SubCategory::Instrument];
 }

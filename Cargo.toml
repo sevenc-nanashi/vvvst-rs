@@ -11,11 +11,23 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 anyhow = "1.0.89"
+base64 = "0.22.1"
 http = "1.1.0"
 include_dir = "0.7.4"
 mime_guess = "2.0.5"
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
 nih_plug_webview = { git = "https://github.com/sevenc-nanashi/nih-plug-webview.git", branch = "fix/backquote-message" }
+rfd = { version = "0.15.0", features = ["common-controls-v6"] }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.40.0", features = ["rt", "rt-multi-thread", "macros", "sync", "fs", "io-util"] }
+tokio = { version = "1.40.0", features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "fs",
+  "io-util",
+] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "2.5.0"
