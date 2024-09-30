@@ -21,14 +21,14 @@ struct Vvvst {
     params: Arc<VvvstParams>,
 
     // 一瞬で終わるのでstdのMutexで十分...のはず？
-    response_receiver: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Response>>>,
+    response_receiver: Arc<Mutex<std::sync::mpsc::Receiver<Response>>>,
 
-    response_sender: Arc<tokio::sync::mpsc::UnboundedSender<Response>>,
+    response_sender: Arc<std::sync::mpsc::Sender<Response>>,
 }
 
 impl Default for Vvvst {
     fn default() -> Self {
-        let (response_sender, response_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (response_sender, response_receiver) = std::sync::mpsc::channel();
         Self {
             params: Arc::new(VvvstParams::default()),
             response_sender: Arc::new(response_sender),
@@ -195,7 +195,7 @@ impl Plugin for Vvvst {
                     Ok(value) => value,
                     Err(err) => {
                         // 可能な限りエラーを返してあげる
-                        let request_id = value.get("id").and_then(|id| id.as_u64());
+                        let request_id = value["requestId"].as_u64();
                         if let Some(request_id) = request_id {
                             let response = Response {
                                 request_id: RequestId(request_id as u32),
@@ -203,7 +203,6 @@ impl Plugin for Vvvst {
                             };
                             response_sender.send(response).unwrap();
                         }
-
                         continue;
                     }
                 };
@@ -213,7 +212,7 @@ impl Plugin for Vvvst {
                 RUNTIME.spawn(async move {
                     let result = Vvvst::process_request(params, value.inner).await;
                     let response = Response {
-                        request_id: value.id,
+                        request_id: value.request_id,
                         payload: match result {
                             Ok(value) => Ok(value),
                             Err(err) => Err(err.to_string()),
@@ -223,9 +222,15 @@ impl Plugin for Vvvst {
                 });
             }
 
-            while let Ok(response) = response_receiver.lock().unwrap().try_recv() {
-                ctx.send_json(serde_json::to_value(response).unwrap())
-                    .unwrap();
+            loop {
+                let response = { response_receiver.lock().unwrap().try_recv() };
+                if let Ok(response) = response {
+                    nih_plug::debug::nih_log!("response: {:?}", response);
+                    ctx.send_json(serde_json::to_value(response).unwrap())
+                        .unwrap();
+                } else {
+                    break;
+                }
             }
         });
 

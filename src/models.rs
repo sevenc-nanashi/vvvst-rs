@@ -9,14 +9,16 @@ pub struct AudioHash(pub u32);
 pub struct RequestId(pub u32);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Response {
     pub request_id: RequestId,
     pub payload: Result<Value, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Request {
-    pub id: RequestId,
+    pub request_id: RequestId,
     pub inner: RequestInner,
 }
 
