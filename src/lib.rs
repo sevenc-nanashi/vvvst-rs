@@ -6,34 +6,101 @@ use nih_plug::prelude::*;
 use nih_plug_webview::*;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, LazyLock, Mutex};
-use tokio::runtime::Runtime;
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::{Arc, LazyLock, Mutex as StdMutex, Once},
+};
+use tokio::{runtime::Runtime, sync::RwLock};
+use tracing::{error, info, warn};
 use utils::TokioMutexParam;
 
 use models::*;
 
 pub static RUNTIME: LazyLock<Runtime> =
     LazyLock::new(|| Runtime::new().expect("Failed to create runtime"));
+static INITIALIZE_LOG: Once = Once::new();
 
 static EDITOR: Dir = include_dir!("$CARGO_MANIFEST_DIR/editor");
 
+// TODO: そのうちマルチトラック・ステレオにする
+#[derive(Debug, Default)]
+struct Mixes {
+    mixes: Vec<f32>,
+    sample_rate: f32,
+}
+
 struct Vvvst {
     params: Arc<VvvstParams>,
+    mixes: Arc<RwLock<Mixes>>,
 
     // 一瞬で終わるのでstdのMutexで十分...のはず？
-    response_receiver: Arc<Mutex<std::sync::mpsc::Receiver<Response>>>,
+    response_receiver: Arc<StdMutex<std::sync::mpsc::Receiver<Response>>>,
 
     response_sender: Arc<std::sync::mpsc::Sender<Response>>,
 }
 
 impl Default for Vvvst {
     fn default() -> Self {
+        INITIALIZE_LOG.call_once(|| {
+            if option_env!("VVVST_LOG").map_or(false, |v| v.len() > 0) {
+                let dest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR").to_string())
+                    .join("logs")
+                    .join(format!(
+                        "{}.log",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                    ));
+
+                let Ok(writer) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&dest)
+                else {
+                    return;
+                };
+
+                let default_panic_hook = std::panic::take_hook();
+
+                std::panic::set_hook(Box::new(move |info| {
+                    let mut panic_writer =
+                        std::fs::File::create(dest.with_extension("panic")).unwrap();
+                    let _ = writeln!(panic_writer, "{:?}", info);
+
+                    default_panic_hook(info);
+                }));
+
+                let _ = tracing_subscriber::fmt()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .try_init();
+            }
+
+            // TODO: ちゃんとエラーダイアログを出す
+            let default_panic_hook = std::panic::take_hook();
+
+            std::panic::set_hook(Box::new(move |info| {
+                rfd::MessageDialog::new()
+                    .set_title("VVVST: Panic")
+                    .set_description(&format!("VVVST Panicked: {:?}", info))
+                    .set_level(rfd::MessageLevel::Error)
+                    .set_buttons(rfd::MessageButtons::Ok)
+                    .show();
+
+                default_panic_hook(info);
+
+                std::process::exit(1);
+            }));
+        });
         let (response_sender, response_receiver) = std::sync::mpsc::channel();
         Self {
             params: Arc::new(VvvstParams::default()),
+            mixes: Arc::new(RwLock::new(Mixes::default())),
             response_sender: Arc::new(response_sender),
-            response_receiver: Arc::new(Mutex::new(response_receiver)),
+            response_receiver: Arc::new(StdMutex::new(response_receiver)),
         }
     }
 }
@@ -41,7 +108,7 @@ impl Default for Vvvst {
 #[derive(Params, Default)]
 struct VvvstParams {
     #[persist = "samples"]
-    samples: TokioMutexParam<BTreeMap<AudioHash, Vec<f32>>>,
+    voices: TokioMutexParam<HashMap<SingingVoiceKey, Vec<u8>>>,
     #[persist = "phrases"]
     phrases: TokioMutexParam<Vec<Phrase>>,
     #[persist = "project"]
@@ -52,6 +119,8 @@ impl Vvvst {
     async fn process_request(
         params: Arc<VvvstParams>,
         request: RequestInner,
+
+        mixes: Arc<RwLock<Mixes>>,
     ) -> anyhow::Result<Value> {
         match request {
             RequestInner::GetVersion => Ok(serde_json::to_value(env!("CARGO_PKG_VERSION"))?),
@@ -92,46 +161,57 @@ impl Vvvst {
                 let mut phrases_ref = params.phrases.lock().await;
                 *phrases_ref = phrases;
 
-                let mut samples = params.samples.lock().await.clone();
-                let missing_audio_hashes = phrases_ref
+                let mut samples = params.voices.lock().await.clone();
+                let missing_voices = phrases_ref
                     .iter()
                     .filter_map(|phrase| {
-                        if samples.get(&phrase.audio_hash).is_some() {
+                        if samples.contains_key(&phrase.voice) {
                             None
                         } else {
-                            Some(phrase.audio_hash)
+                            Some(phrase.voice.clone())
                         }
                     })
-                    .collect::<BTreeSet<_>>();
-                let unused_audio_hashes = samples
+                    .collect::<HashSet<_>>();
+                let unused_voices = samples
                     .keys()
-                    .filter(|audio_hash| {
-                        !phrases_ref
-                            .iter()
-                            .any(|phrase| phrase.audio_hash == **audio_hash)
-                    })
+                    .filter(|voice| !phrases_ref.iter().any(|phrase| phrase.voice == **voice))
                     .cloned()
-                    .collect::<BTreeSet<_>>();
-                for audio_hash in unused_audio_hashes {
+                    .collect::<HashSet<_>>();
+                for audio_hash in unused_voices {
                     samples.remove(&audio_hash);
                 }
                 Ok(serde_json::to_value(SetPhraseResult {
-                    missing_audio_hashes: missing_audio_hashes.into_iter().collect(),
+                    missing_voices: missing_voices.into_iter().collect(),
                 })?)
             }
-            RequestInner::SetSamples(samples) => {
-                let mut samples_ref = params.samples.lock().await;
-                for (audio_hash, sample) in samples {
-                    samples_ref.insert(audio_hash, sample);
+            RequestInner::SetVoices(samples) => {
+                {
+                    let mut samples_ref = params.voices.lock().await;
+                    for (audio_hash, sample) in samples {
+                        samples_ref.insert(audio_hash, base64.decode(sample)?);
+                    }
                 }
+
+                let params = Arc::clone(&params);
+                let mixes = Arc::clone(&mixes);
+
+                tokio::spawn(async move {
+                    Vvvst::update_mixes(params, mixes, None).await;
+                });
                 Ok(serde_json::Value::Null)
             }
             RequestInner::ShowImportFileDialog(params) => {
-                let dialog = rfd::AsyncFileDialog::new().set_title(&params.title);
-                let dialog = if params.name.is_some() && params.filters.is_some() {
-                    dialog.add_filter(&params.name.unwrap(), &params.filters.unwrap())
-                } else {
-                    dialog
+                let dialog = match &params {
+                    ShowImportFileDialog {
+                        title,
+                        name: Some(name),
+                        filters: Some(filters),
+                    } => rfd::AsyncFileDialog::new()
+                        .set_title(title)
+                        .add_filter(name, filters),
+                    ShowImportFileDialog { title, .. } => {
+                        rfd::AsyncFileDialog::new().set_title(title)
+                    }
                 };
 
                 let result = dialog.pick_file().await;
@@ -213,6 +293,69 @@ impl Vvvst {
             }
         }
     }
+
+    async fn update_mixes(
+        params: Arc<VvvstParams>,
+        mixes: Arc<RwLock<Mixes>>,
+        new_sample_rate: Option<f32>,
+    ) {
+        let phrases = params.phrases.lock().await.clone();
+        let voices = params.voices.lock().await.clone();
+        let mut mixes = mixes.write().await;
+        mixes.mixes.clear();
+        info!("updating mixes using {} phrases", phrases.len());
+
+        let new_sample_rate = new_sample_rate.unwrap_or(mixes.sample_rate);
+
+        let max_start = phrases
+            .iter()
+            .map(|phrase| phrase.start)
+            .fold(0.0, f32::max);
+        let mut mix = vec![0.0; (max_start * new_sample_rate) as usize];
+        for phrase in phrases {
+            if let Some(voice) = voices.get(&phrase.voice) {
+                let mut wav = wav_io::reader::Reader::from_vec(voice.clone()).unwrap();
+                let header = wav.read_header().unwrap();
+                let base_samples = wav.get_samples_f32().unwrap();
+                let samples = if header.channels == 1 {
+                    base_samples
+                } else {
+                    wav_io::utils::stereo_to_mono(base_samples)
+                };
+                let samples = wav_io::resample::linear(
+                    samples,
+                    1,
+                    header.sample_rate,
+                    (new_sample_rate) as u32,
+                );
+                let start = (phrase.start * new_sample_rate).floor() as isize;
+                let end = start + samples.len() as isize;
+
+                if end > mix.len() as isize {
+                    mix.resize(end as usize, 0.0);
+                }
+                for i in 0..samples.len() {
+                    let frame = start + i as isize;
+                    if frame < 0 {
+                        continue;
+                    }
+                    let frame = frame as usize;
+                    if mix[frame] > f32::MAX - samples[i] {
+                        mix[frame] = f32::MAX;
+                    } else if mix[frame] < f32::MIN - samples[i] {
+                        mix[frame] = f32::MIN;
+                    } else {
+                        mix[frame] += samples[i];
+                    }
+                }
+            }
+        }
+
+        info!("mixes updated, {} samples", mix.len());
+
+        mixes.mixes = mix;
+        mixes.sample_rate = new_sample_rate;
+    }
 }
 
 impl Plugin for Vvvst {
@@ -243,8 +386,40 @@ impl Plugin for Vvvst {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let transport = context.transport();
+        if let Ok(mixes) = self.mixes.try_read() {
+            if transport.sample_rate == mixes.sample_rate {
+                if transport.playing && mixes.mixes.len() > 0 {
+                    let current_sample = transport.pos_samples().unwrap() as usize;
+                    let samples_len = buffer.samples();
+                    let sample_range =
+                        current_sample..(current_sample + samples_len).min(mixes.mixes.len());
+                    let mix_part_len = sample_range.len();
+                    if sample_range.start < mixes.mixes.len() {
+                        let slices = buffer.as_slice();
+                        if sample_range.len() == samples_len {
+                            slices[0].copy_from_slice(&mixes.mixes[sample_range.clone()]);
+                            slices[1].copy_from_slice(&mixes.mixes[sample_range]);
+                        } else {
+                            slices[0][0..mix_part_len]
+                                .copy_from_slice(&mixes.mixes[sample_range.clone()]);
+                            slices[0][mix_part_len..samples_len].fill(0.0);
+                            slices[1][0..mix_part_len].copy_from_slice(&mixes.mixes[sample_range]);
+                            slices[1][mix_part_len..samples_len].fill(0.0);
+                        }
+                    }
+                }
+            } else {
+                RUNTIME.spawn(Vvvst::update_mixes(
+                    Arc::clone(&self.params),
+                    Arc::clone(&self.mixes),
+                    Some(transport.sample_rate),
+                ));
+            }
+        }
+
         ProcessStatus::Normal
     }
 
@@ -252,11 +427,14 @@ impl Plugin for Vvvst {
         let params = Arc::clone(&self.params);
         let response_sender = self.response_sender.clone();
         let response_receiver = self.response_receiver.clone();
+        let mixes = Arc::clone(&self.mixes);
 
         let editor = WebViewEditor::new(
             HTMLSource::URL(if cfg!(debug_assertions) {
+                info!("using dev server");
                 option_env!("VVVST_DEV_SERVER_URL").unwrap_or("http://localhost:5173")
             } else {
+                info!("using bundled editor");
                 "app://."
             }),
             (1024, 720),
@@ -265,6 +443,7 @@ impl Plugin for Vvvst {
             Ok(EDITOR
                 .get_file(request.uri().path())
                 .map(|file| {
+                    info!("serving file: {:?}", file.path());
                     http::Response::builder()
                         .status(200)
                         .header(
@@ -322,16 +501,20 @@ impl Plugin for Vvvst {
                                 request_id: RequestId(request_id as u32),
                                 payload: Err(format!("failed to parse request: {}", err)),
                             };
+                            warn!("failed to parse request: {}", err);
                             response_sender.send(response).unwrap();
+                        } else {
+                            error!("failed to parse request: {}", err);
                         }
                         continue;
                     }
                 };
                 let params = Arc::clone(&params);
                 let response_sender = Arc::clone(&response_sender);
+                let mixes = Arc::clone(&mixes);
 
                 RUNTIME.spawn(async move {
-                    let result = Vvvst::process_request(params, value.inner).await;
+                    let result = Vvvst::process_request(params, value.inner, mixes).await;
                     let response = Response {
                         request_id: value.request_id,
                         payload: match result {
@@ -343,15 +526,9 @@ impl Plugin for Vvvst {
                 });
             }
 
-            loop {
-                let response = { response_receiver.lock().unwrap().try_recv() };
-                if let Ok(response) = response {
-                    nih_plug::debug::nih_log!("response: {:?}", response);
-                    ctx.send_json(serde_json::to_value(response).unwrap())
-                        .unwrap();
-                } else {
-                    break;
-                }
+            while let Ok(response) = response_receiver.lock().unwrap().try_recv() {
+                ctx.send_json(serde_json::to_value(response).unwrap())
+                    .unwrap();
             }
         });
 

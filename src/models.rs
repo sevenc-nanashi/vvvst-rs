@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct AudioHash(pub u32);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SingingVoiceKey(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub u32);
@@ -32,7 +32,7 @@ pub enum RequestInner {
     GetProject,
     SetProject(String),
     SetPhrases(Vec<Phrase>),
-    SetSamples(BTreeMap<AudioHash, Vec<f32>>),
+    SetVoices(HashMap<SingingVoiceKey, String>),
 
     ShowMessageDialog(ShowMessageDialog),
     ShowImportFileDialog(ShowImportFileDialog),
@@ -56,15 +56,14 @@ pub struct ShowImportFileDialog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Phrase {
-    pub start_at: f32,
-    pub duration: f32,
-    pub audio_hash: AudioHash,
+    pub start: f32,
+    pub voice: SingingVoiceKey,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetPhraseResult {
-    pub missing_audio_hashes: Vec<AudioHash>,
+    pub missing_voices: Vec<SingingVoiceKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
